@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "GodofDrakes.CommandPalette.OSRS (Package)": {
+      "commandName": "MsixPackage",
+      "doNotLaunchApp": true
+    },
+    "GodofDrakes.CommandPalette.OSRS (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
