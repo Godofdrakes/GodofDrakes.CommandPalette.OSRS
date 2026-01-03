@@ -7,4 +7,6 @@ public static class Icons
 	public static IconInfo Link => new IconInfo( "\uE71B" );
 
 	public static IconInfo OpenInExternalWindow => new IconInfo( "\uE8A7" );
+
+	public static IconInfo Wiki => new IconInfo( "https://oldschool.runescape.wiki/images/Favicon.ico" );
 }

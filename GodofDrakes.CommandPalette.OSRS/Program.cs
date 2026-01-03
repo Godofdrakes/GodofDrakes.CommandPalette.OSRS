@@ -7,13 +7,12 @@ using System.IO;
 using System.Threading.RateLimiting;
 using GodofDrakes.CommandPalette.Hosting.Extensions;
 using GodofDrakes.CommandPalette.OSRS.Extensions;
-using GodofDrakes.CommandPalette.OSRS.Pages;
+using GodofDrakes.CommandPalette.OSRS.ViewModels;
+using GodofDrakes.CommandPalette.Reactive.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Polly;
-using Polly.RateLimiting;
-using Polly.Telemetry;
 using WikiClientLibrary.Client;
 using WikiClientLibrary.Sites;
 
@@ -27,9 +26,13 @@ public static class Program
 		var builder = Host.CreateDefaultBuilder( args )
 			.UseHostedExtensionLifetime( args )
 			.AddHostedExtension()
-			.AddLogFile();
+			.AddLogFile()
+			.ConfigureSplat();
 
-		var host = builder.Build();
+		var host = builder.Build()
+			// Since MS DI container is a different type,
+			// we need to re-register the built container with Splat again
+			.InitializeSplat();
 
 		host.Run();
 	}
@@ -39,11 +42,10 @@ public static class Program
 		return hostBuilder.ConfigureServices( ( context, services ) =>
 		{
 			services.AddHostedExtension<Extension>();
-			services.AddTransient<ExtensionCommandProvider>();
-			services.AddTransient<OSRSPage>();
-			services.AddTransient<WikiSearchPage>();
 
-			services.AddResiliencePipeline( "OpenSearch", builder =>
+			services.AddSingleton<ExtensionCommandProvider>();
+
+			services.AddResiliencePipeline( typeof(OpenSearchViewModel), builder =>
 			{
 				var options = new SlidingWindowRateLimiterOptions()
 				{

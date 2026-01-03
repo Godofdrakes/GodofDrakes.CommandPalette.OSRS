@@ -3,7 +3,8 @@
 // See the LICENSE file in the project root for more information.
 
 using System;
-using GodofDrakes.CommandPalette.OSRS.Pages;
+using System.Reactive.Disposables;
+using GodofDrakes.CommandPalette.OSRS.Views;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
 
@@ -11,31 +12,39 @@ namespace GodofDrakes.CommandPalette.OSRS;
 
 internal sealed partial class ExtensionCommandProvider : CommandProvider
 {
-	private readonly OSRSPage _osrsPage;
+	private readonly CompositeDisposable _onDispose = [];
 
 	private readonly ICommandItem[] _commands;
 
-	public ExtensionCommandProvider( OSRSPage osrsPage )
+	public ExtensionCommandProvider( IServiceProvider serviceProvider )
 	{
-		ArgumentNullException.ThrowIfNull( osrsPage );
+		this.Id = "godofdrakes.commandpalette.osrs";
+		this.Icon = Icons.Wiki;
+		this.DisplayName = "CmdPal Commands for Old School Runescape";
 
-		this.DisplayName = "Old School Runescape";
-		this.Icon = IconHelpers.FromRelativePath( "Assets\\StoreLogo.png" );
+		var openSearch = new OpenSearchView( serviceProvider );
 
-		_osrsPage = osrsPage;
+		_onDispose.Add( openSearch );
 
 		_commands =
 		[
 			new CommandItem()
 			{
-				Title = DisplayName,
-				Command = _osrsPage,
-			},
+				Title = "Search the OSRS Wiki",
+				Command = openSearch,
+			}
 		];
 	}
 
 	public override ICommandItem[] TopLevelCommands()
 	{
 		return _commands;
+	}
+
+	public override void Dispose()
+	{
+		_onDispose.Dispose();
+
+		base.Dispose();
 	}
 }
