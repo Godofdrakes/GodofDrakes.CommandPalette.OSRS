@@ -1,12 +1,15 @@
 ﻿using System;
+using System.Reactive.Disposables;
 using GodofDrakes.CommandPalette.OSRS.ViewModels;
 using GodofDrakes.CommandPalette.Reactive.Views;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace GodofDrakes.CommandPalette.OSRS.Views;
 
-public sealed partial class OpenSearchView : DynamicListView<OpenSearchViewModel>, IDisposable
+public sealed partial class OpenSearchView : DynamicListView<OpenSearchViewModel>
 {
+	private readonly CompositeDisposable _onDispose = [];
+
 	private readonly OpenSearchViewModel _defaultViewModel;
 
 	public OpenSearchView( IServiceProvider serviceProvider )
@@ -19,8 +22,14 @@ public sealed partial class OpenSearchView : DynamicListView<OpenSearchViewModel
 		this.ViewModel = _defaultViewModel;
 	}
 
-	public void Dispose()
+	protected override void Dispose( bool disposing )
 	{
-		_defaultViewModel.Dispose();
+		if ( disposing )
+		{
+			_onDispose.Dispose();
+			_defaultViewModel.Dispose();
+		}
+
+		base.Dispose( disposing );
 	}
 }

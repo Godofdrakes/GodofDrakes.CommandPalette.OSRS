@@ -47,7 +47,7 @@ public static class Program
 
 			services.AddResiliencePipeline( typeof(OpenSearchViewModel), builder =>
 			{
-				var options = new SlidingWindowRateLimiterOptions()
+				var rateLimiterOptions = new SlidingWindowRateLimiterOptions()
 				{
 					PermitLimit = 60,
 					SegmentsPerWindow = 4,
@@ -55,7 +55,7 @@ public static class Program
 				};
 
 				builder
-					.AddRateLimiter( new SlidingWindowRateLimiter( options ) )
+					.AddRateLimiter( new SlidingWindowRateLimiter( rateLimiterOptions ) )
 					.AddConcurrencyLimiter( 1, 10 );
 			} );
 

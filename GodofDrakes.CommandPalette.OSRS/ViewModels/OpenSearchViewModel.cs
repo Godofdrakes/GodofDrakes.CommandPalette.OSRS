@@ -1,12 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reactive.Disposables;
 using System.Reactive.Disposables.Fluent;
 using System.Reactive.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using DynamicData;
+using GodofDrakes.CommandPalette.OSRS.Extensions;
+using GodofDrakes.CommandPalette.Reactive.Interfaces;
 using GodofDrakes.CommandPalette.Reactive.ViewModels;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
@@ -21,7 +25,7 @@ using WikiPageAndUrl = (WikiClientLibrary.Pages.WikiPage Page, string Url);
 
 namespace GodofDrakes.CommandPalette.OSRS.ViewModels;
 
-public sealed partial class OpenSearchViewModel : DynamicListViewModel, IDisposable
+public sealed partial class OpenSearchViewModel : DynamicListViewModel, INotifyLoading, IDisposable
 {
 	private readonly CompositeDisposable _onDispose = [];
 
@@ -101,25 +105,25 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, IDisposa
 		}
 	}
 
-	private Task<List<WikiPageAndUrl>> CreateWikiPages( IList<OpenSearchResultEntry> search, CancellationToken token )
+	private Task<List<WikiPage>> CreateWikiPages( IList<OpenSearchResultEntry> search, CancellationToken token )
 	{
 		if ( search.Count < 1 )
 		{
 			// Avoids utilizing the pipeline for trivial work
 
-			return Task.FromResult<List<WikiPageAndUrl>>( [] );
+			return Task.FromResult<List<WikiPage>>( [] );
 		}
 
 		return Run( Impl, token );
 
-		async Task<List<WikiPageAndUrl>> Impl( CancellationToken t )
+		async Task<List<WikiPage>> Impl( CancellationToken t )
 		{
 			var list = search
 				.Where( entry => !string.IsNullOrWhiteSpace( entry.Title ) )
-				.Select( WikiPageAndUrl ( entry ) => (new WikiPage( _wikiSite, entry.Title ), entry.Url) )
+				.Select( entry => new WikiPage( _wikiSite, entry.Title ) )
 				.ToList();
 
-			await list.Select( pair => pair.Page ).RefreshAsync( new WikiPageQueryProvider()
+			await list.RefreshAsync( new WikiPageQueryProvider()
 			{
 				Properties =
 				[
@@ -128,6 +132,12 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, IDisposa
 					{
 						ThumbnailSize = 200,
 					},
+					new ExtractsPropertyProvider()
+					{
+						AsPlainText = true,
+						MaxSentences = 1,
+						IntroductionOnly = true,
+					}
 				],
 			}, t );
 
@@ -135,15 +145,32 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, IDisposa
 		}
 	}
 
-	private static IList<IListItem> CreateListItems( List<WikiPageAndUrl> list )
+	private IList<IListItem> CreateListItems( List<WikiPage> list )
 	{
-		return list.Select( IListItem ( pair ) =>
+		return list.Select( IListItem ( page ) =>
 			{
+				var url = _wikiSite.SiteInfo.MakeArticleUrl( page.Title! );
+
+				IIconInfo? icon = null;
+
+				if ( page.TryGetPropertyGroup( out PageImagesPropertyGroup? pageImages ) )
+				{
+					icon = new IconInfo( pageImages.ThumbnailImage.Url );
+				}
+
+				var subtitle = url;
+
+				if ( page.TryGetPropertyGroup( out ExtractsPropertyGroup? pageExtracts ) )
+				{
+					subtitle = pageExtracts.Extract;
+				}
+
 				return new ListItem()
 				{
-					Title = pair.Page.Title ?? string.Empty,
-					Subtitle = pair.Url,
-					Command = new OpenUrlCommand( pair.Url )
+					Icon = icon,
+					Title = page.Title!,
+					Subtitle = subtitle,
+					Command = new OpenUrlCommand( url )
 					{
 						Result = CommandResult.Dismiss(),
 					},
@@ -152,7 +179,10 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, IDisposa
 			.ToList();
 	}
 
-	private Task<T> Run<T>( Func<CancellationToken, Task<T>> work, CancellationToken cancellationToken )
+	private Task<T> Run<T>(
+		Func<CancellationToken, Task<T>> work,
+		CancellationToken cancellationToken,
+		[CallerMemberName] string memberName = "" )
 	{
 		ArgumentNullException.ThrowIfNull( work );
 
@@ -162,9 +192,21 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, IDisposa
 
 			async Task<T> RunAsync()
 			{
-				var task = _pipeline.ExecuteAsync( async token => await work( token ), cancellationToken );
+				var context = ResilienceContextPool.Shared.Get( memberName, cancellationToken );
 
-				return await task;
+				try
+				{
+					return await _pipeline.ExecuteAsync( Callback, context );
+
+					ValueTask<T> Callback( ResilienceContext c )
+					{
+						return new ValueTask<T>( work( c.CancellationToken ) );
+					}
+				}
+				finally
+				{
+					ResilienceContextPool.Shared.Return( context );
+				}
 			}
 		}
 
