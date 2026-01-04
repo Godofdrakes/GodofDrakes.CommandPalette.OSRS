@@ -8,12 +8,11 @@ namespace GodofDrakes.CommandPalette.OSRS.Views;
 
 public sealed partial class OpenSearchView : DynamicListView<OpenSearchViewModel>
 {
-	private readonly CompositeDisposable _onDispose = [];
-
 	private readonly OpenSearchViewModel _defaultViewModel;
 
 	public OpenSearchView( IServiceProvider serviceProvider )
 	{
+		this.Id = "godofdrakes.commandpalette.osrs.opensearch";
 		this.Name = nameof(OpenSearchView);
 		this.Title = "Open Search View";
 
@@ -26,7 +25,6 @@ public sealed partial class OpenSearchView : DynamicListView<OpenSearchViewModel
 	{
 		if ( disposing )
 		{
-			_onDispose.Dispose();
 			_defaultViewModel.Dispose();
 		}
 

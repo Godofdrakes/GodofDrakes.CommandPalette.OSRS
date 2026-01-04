@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reactive;
 using System.Reactive.Disposables;
 using System.Reactive.Disposables.Fluent;
 using System.Reactive.Linq;
@@ -14,6 +15,7 @@ using GodofDrakes.CommandPalette.Reactive.Interfaces;
 using GodofDrakes.CommandPalette.Reactive.ViewModels;
 using Microsoft.CommandPalette.Extensions;
 using Microsoft.CommandPalette.Extensions.Toolkit;
+using Microsoft.Extensions.Logging;
 using Polly;
 using Polly.Registry;
 using ReactiveUI;
@@ -21,7 +23,6 @@ using WikiClientLibrary.Pages;
 using WikiClientLibrary.Pages.Queries;
 using WikiClientLibrary.Pages.Queries.Properties;
 using WikiClientLibrary.Sites;
-using WikiPageAndUrl = (WikiClientLibrary.Pages.WikiPage Page, string Url);
 
 namespace GodofDrakes.CommandPalette.OSRS.ViewModels;
 
@@ -30,59 +31,209 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, INotifyL
 	private readonly CompositeDisposable _onDispose = [];
 
 	private readonly WikiSite _wikiSite;
+	private readonly ILogger<OpenSearchViewModel> _logger;
 	private readonly ResiliencePipeline? _pipeline;
-	private readonly ReactiveCommand<string, IList<IListItem>> _searchCommand;
+	private readonly ReactiveCommand<string, IList<OpenSearchResultEntry>> _searchCommand;
 	private readonly ObservableAsPropertyHelper<bool> _isLoading;
 
 	public bool IsLoading => _isLoading.Value;
 
-	public OpenSearchViewModel( WikiSite wikiSite, ResiliencePipelineProvider<Type>? pipelineProvider )
+	public OpenSearchViewModel(
+		WikiSite wikiSite,
+		ILogger<OpenSearchViewModel> logger,
+		ResiliencePipelineProvider<Type>? pipelineProvider )
 	{
 		ArgumentNullException.ThrowIfNull( wikiSite );
+		ArgumentNullException.ThrowIfNull( logger );
 
 		_wikiSite = wikiSite;
+		_logger = logger;
 		_pipeline = pipelineProvider?.GetPipeline( typeof(OpenSearchViewModel) );
 
-		_searchCommand = ReactiveCommand.CreateFromObservable( ( string s ) =>
-		{
-			return Observable.Return( s )
-				.SelectMany( OpenSearchAsync )
-				.SelectMany( CreateWikiPages )
-				.Select( CreateListItems );
-		} );
+		_searchCommand = ReactiveCommand.CreateFromTask( async ( string s, CancellationToken token ) =>
+			{
+				return await OpenSearchAsync( s, token );
+			} )
+			.DisposeWith( _onDispose );
 
-		_isLoading = _searchCommand.IsExecuting.ToProperty( this, x => x.IsLoading );
+		_searchCommand.ThrownExceptions
+			.Subscribe( exception =>
+			{
+				var status = new StatusMessage()
+				{
+					Message = exception.Message,
+					State = MessageState.Error,
+				};
+
+				ExtensionHost.ShowStatus( status, StatusContext.Page );
+			} ).DisposeWith( _onDispose );
+
+		_isLoading = _searchCommand.IsExecuting
+			.ToProperty( this, x => x.IsLoading )
+			.DisposeWith( _onDispose );
 
 		this.WhenAnyValue( x => x.SearchText )
 			.Throttle( TimeSpan.FromMilliseconds( 1000 ) )
 			.DistinctUntilChanged()
 			.InvokeCommand( _searchCommand )
 			.DisposeWith( _onDispose );
-
-		_onDispose.Add( _searchCommand );
-		_onDispose.Add( _isLoading );
 	}
 
-	public override IObservable<IChangeSet<IListItem, IListItem>> Connect()
+	public override IObservable<IChangeSet<IListItem, string>> Connect()
 	{
-		return ObservableChangeSet.Create( CreateChangeSet, ( IListItem item ) => item );
-	}
+		var searchResults = ObservableChangeSet.Create<WikiPage, string>( cache =>
+		{
+			var onDispose = new CompositeDisposable();
 
-	private IDisposable CreateChangeSet( ISourceCache<IListItem, IListItem> cache )
-	{
-		var dispose = new CompositeDisposable();
-
-		_searchCommand
-			.Subscribe( list =>
-			{
-				cache.Edit( updater =>
+			_searchCommand
+				.Select( entries =>
 				{
-					updater.Load( list );
+					return entries.Select( entry =>
+					{
+						return new WikiPage( _wikiSite, entry.Title );
+					} );
+				} )
+				.Subscribe( pages =>
+				{
+					cache.Edit( updater =>
+					{
+						updater.Load( pages );
+					} );
+				} )
+				.DisposeWith( onDispose );
+
+			return onDispose;
+		}, page => page.Title! );
+
+		return searchResults
+			.TransformOnObservable( sourcePage =>
+			{
+				return Observable.Create<WikiPage>( async ( o, token ) =>
+				{
+					try
+					{
+						var workingPage = sourcePage;
+
+						await RefreshPageInfoAsync( workingPage, token );
+
+						if ( workingPage.IsRedirect )
+						{
+							var target = await ResolveRedirectsAsync( workingPage, token );
+
+							if ( target is not null )
+							{
+								workingPage = target;
+							}
+						}
+
+						o.OnNext( workingPage );
+					}
+					catch ( OperationCanceledException )
+					{
+						o.OnCompleted();
+					}
+					catch ( Exception exception )
+					{
+						o.OnError( exception );
+					}
 				} );
 			} )
-			.DisposeWith( dispose );
+			.AutoRefreshOnObservable( page =>
+			{
+				return Observable.FromAsync( token =>
+				{
+					return RefreshPageDetailsAsync( page, token );
+				} );
+			} )
+			.TransformWithInlineUpdate( CreateListItem, UpdateListItem, transformOnRefresh: true )
+			.Cast( IListItem ( item ) => item );
+	}
 
-		return dispose;
+	private Task<WikiPage> RefreshPageInfoAsync( WikiPage page, CancellationToken cancellationToken )
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace( page.Title, nameof(page) );
+
+		return Run( ImplAsync, cancellationToken );
+
+		async Task<WikiPage> ImplAsync( CancellationToken token )
+		{
+			_logger.LogDebug( "Refreshing info for {Page}", page.Title! );
+
+			await page.RefreshAsync( new WikiPageQueryProvider()
+			{
+				Properties =
+				[
+					new PageInfoPropertyProvider(),
+				],
+			}, token );
+
+			_logger.LogDebug( "Refreshed info for {Page} ({IsRedirect})", page.Title!, page.IsRedirect );
+
+			return page;
+		}
+	}
+
+	private Task<WikiPage?> ResolveRedirectsAsync( WikiPage page, CancellationToken cancellationToken )
+	{
+		ArgumentException.ThrowIfNullOrWhiteSpace( page.Title, nameof(page) );
+
+		if ( !page.IsRedirect )
+		{
+			throw new ArgumentException( "Page is not a redirector", nameof(page) );
+		}
+
+		return Run( ImplAsync, cancellationToken );
+
+		async Task<WikiPage?> ImplAsync( CancellationToken token )
+		{
+			_logger.LogDebug( "Resolving redirects for {Page}", page.Title! );
+
+			var targetPage = new WikiPage( page.Site, page.Title! );
+
+			await targetPage.RefreshAsync( PageQueryOptions.ResolveRedirects, token );
+
+			if ( targetPage.RedirectPath.Count <= 0 )
+			{
+				_logger.LogDebug( "Failed to resolve redirects for {Page}", page.Title! );
+
+				return null;
+			}
+
+			_logger.LogDebug( "Resolved redirects for {Page}. Found {Target}.", page.Title!, targetPage.Title! );
+
+			return targetPage;
+		}
+	}
+
+	private Task<WikiPage> RefreshPageDetailsAsync( WikiPage page, CancellationToken cancellationToken )
+	{
+		return Run( ImplAsync, cancellationToken );
+
+		async Task<WikiPage> ImplAsync( CancellationToken token )
+		{
+			_logger.LogDebug( "Refreshing details for {Page}", page.Title! );
+
+			await page.RefreshAsync( new WikiPageQueryProvider()
+			{
+				Properties =
+				[
+					new PageImagesPropertyProvider()
+					{
+						ThumbnailSize = 200,
+					},
+					new ExtractsPropertyProvider()
+					{
+						AsPlainText = true,
+						IntroductionOnly = true,
+						MaxSentences = 1,
+					},
+				],
+			}, token );
+
+			_logger.LogDebug( "Refreshed details for {Page}", page.Title! );
+
+			return page;
+		}
 	}
 
 	private Task<IList<OpenSearchResultEntry>> OpenSearchAsync( string s, CancellationToken token )
@@ -95,88 +246,94 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, INotifyL
 			return Task.FromResult<IList<OpenSearchResultEntry>>( [] );
 		}
 
-		return Run( Impl, token );
+		return Run( ImplAsync, token );
 
-		Task<IList<OpenSearchResultEntry>> Impl( CancellationToken t )
+		async Task<IList<OpenSearchResultEntry>> ImplAsync( CancellationToken t )
 		{
-			var task = _wikiSite.OpenSearchAsync( s, OpenSearchOptions.None );
-
-			return task.WaitAsync( t );
+			const int maxCount = 10;
+			const OpenSearchOptions options = OpenSearchOptions.None;
+			return await _wikiSite.OpenSearchAsync( s, maxCount, options, t );
 		}
 	}
 
-	private Task<List<WikiPage>> CreateWikiPages( IList<OpenSearchResultEntry> search, CancellationToken token )
+	private static ListItem CreateListItem( WikiPage page )
 	{
-		if ( search.Count < 1 )
-		{
-			// Avoids utilizing the pipeline for trivial work
+		var url = page.Site.SiteInfo.MakeArticleUrl( page.Title! );
 
-			return Task.FromResult<List<WikiPage>>( [] );
+		return new ListItem()
+		{
+			Icon = Icons.OpenInExternalWindow,
+			Title = page.Title!,
+			Subtitle = url,
+			Command = new OpenUrlCommand( url )
+			{
+				Result = CommandResult.Dismiss(),
+			},
+		};
+	}
+
+	private static void UpdateListItem( ListItem item, WikiPage page )
+	{
+		if ( page.TryGetPropertyGroup( out PageImagesPropertyGroup? pageImages ) )
+		{
+			item.Icon = new IconInfo( pageImages.ThumbnailImage.Url );
 		}
 
-		return Run( Impl, token );
-
-		async Task<List<WikiPage>> Impl( CancellationToken t )
+		if ( !string.IsNullOrWhiteSpace( page.Title ) )
 		{
-			var list = search
-				.Where( entry => !string.IsNullOrWhiteSpace( entry.Title ) )
-				.Select( entry => new WikiPage( _wikiSite, entry.Title ) )
-				.ToList();
+			var url = page.Site.SiteInfo.MakeArticleUrl( page.Title! );
 
-			await list.RefreshAsync( new WikiPageQueryProvider()
+			item.Title = page.Title;
+
+			// This may get overridden below
+			item.Subtitle = url;
+
+			item.Command = new OpenUrlCommand( url )
 			{
-				Properties =
-				[
-					new PageInfoPropertyProvider(),
-					new PageImagesPropertyProvider()
+				Result = CommandResult.Dismiss(),
+			};
+		}
+
+		if ( page.TryGetPropertyGroup( out ExtractsPropertyGroup? pageExtracts ) )
+		{
+			item.Subtitle = pageExtracts.Extract;
+		}
+	}
+
+	private Task Run(
+		Func<CancellationToken, Task> work,
+		CancellationToken cancellationToken,
+		[CallerMemberName] string memberName = "" )
+	{
+		ArgumentNullException.ThrowIfNull( work );
+
+		if ( _pipeline is not null )
+		{
+			return RunAsync();
+
+			[DebuggerNonUserCode]
+			async Task RunAsync()
+			{
+				var context = ResilienceContextPool.Shared.Get( memberName, cancellationToken );
+
+				try
+				{
+					await _pipeline.ExecuteAsync( ImplAsync, context );
+
+					[DebuggerNonUserCode]
+					async ValueTask ImplAsync( ResilienceContext c )
 					{
-						ThumbnailSize = 200,
-					},
-					new ExtractsPropertyProvider()
-					{
-						AsPlainText = true,
-						MaxSentences = 1,
-						IntroductionOnly = true,
+						await work( c.CancellationToken );
 					}
-				],
-			}, t );
-
-			return list;
+				}
+				finally
+				{
+					ResilienceContextPool.Shared.Return( context );
+				}
+			}
 		}
-	}
 
-	private IList<IListItem> CreateListItems( List<WikiPage> list )
-	{
-		return list.Select( IListItem ( page ) =>
-			{
-				var url = _wikiSite.SiteInfo.MakeArticleUrl( page.Title! );
-
-				IIconInfo? icon = null;
-
-				if ( page.TryGetPropertyGroup( out PageImagesPropertyGroup? pageImages ) )
-				{
-					icon = new IconInfo( pageImages.ThumbnailImage.Url );
-				}
-
-				var subtitle = url;
-
-				if ( page.TryGetPropertyGroup( out ExtractsPropertyGroup? pageExtracts ) )
-				{
-					subtitle = pageExtracts.Extract;
-				}
-
-				return new ListItem()
-				{
-					Icon = icon,
-					Title = page.Title!,
-					Subtitle = subtitle,
-					Command = new OpenUrlCommand( url )
-					{
-						Result = CommandResult.Dismiss(),
-					},
-				};
-			} )
-			.ToList();
+		return work( cancellationToken );
 	}
 
 	private Task<T> Run<T>(
@@ -196,11 +353,12 @@ public sealed partial class OpenSearchViewModel : DynamicListViewModel, INotifyL
 
 				try
 				{
-					return await _pipeline.ExecuteAsync( Callback, context );
+					return await _pipeline.ExecuteAsync( ImplAsync, context );
 
-					ValueTask<T> Callback( ResilienceContext c )
+					[DebuggerNonUserCode]
+					async ValueTask<T> ImplAsync( ResilienceContext c )
 					{
-						return new ValueTask<T>( work( c.CancellationToken ) );
+						return await work( c.CancellationToken );
 					}
 				}
 				finally

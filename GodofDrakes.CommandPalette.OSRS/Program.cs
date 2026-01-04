@@ -5,6 +5,7 @@
 using System;
 using System.IO;
 using System.Threading.RateLimiting;
+using System.Threading.Tasks;
 using GodofDrakes.CommandPalette.Hosting.Extensions;
 using GodofDrakes.CommandPalette.OSRS.Extensions;
 using GodofDrakes.CommandPalette.OSRS.ViewModels;
@@ -13,6 +14,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Polly;
+using Polly.RateLimiting;
+using Polly.Retry;
 using WikiClientLibrary.Client;
 using WikiClientLibrary.Sites;
 
@@ -43,20 +46,51 @@ public static class Program
 		{
 			services.AddHostedExtension<Extension>();
 
-			services.AddSingleton<ExtensionCommandProvider>();
+			services.AddSingleton<Commands.ExtensionCommandProvider>();
 
 			services.AddResiliencePipeline( typeof(OpenSearchViewModel), builder =>
 			{
 				var rateLimiterOptions = new SlidingWindowRateLimiterOptions()
 				{
 					PermitLimit = 60,
-					SegmentsPerWindow = 4,
+					SegmentsPerWindow = 6,
 					Window = TimeSpan.FromSeconds( 60 ),
+				};
+
+				var retryOptions = new RetryStrategyOptions()
+				{
+					BackoffType = DelayBackoffType.Exponential,
+					MaxRetryAttempts = int.MaxValue,
+					ShouldHandle = args =>
+					{
+						if ( args.Outcome.Exception is OperationCanceledException )
+						{
+							return ValueTask.FromResult( false );
+						}
+
+						if ( args.Outcome.Exception is RateLimiterRejectedException )
+						{
+							return ValueTask.FromResult( true );
+						}
+
+						return ValueTask.FromResult( false );
+					},
+					DelayGenerator = arguments =>
+					{
+						TimeSpan? delay = null;
+
+						if ( arguments.Outcome.Result is RateLimiterRejectedException rateLimit )
+						{
+							delay = rateLimit.RetryAfter;
+						}
+
+						return new ValueTask<TimeSpan?>( delay );
+					},
 				};
 
 				builder
 					.AddRateLimiter( new SlidingWindowRateLimiter( rateLimiterOptions ) )
-					.AddConcurrencyLimiter( 1, 10 );
+					.AddRetry( retryOptions );
 			} );
 
 			services.AddSingleton( s =>

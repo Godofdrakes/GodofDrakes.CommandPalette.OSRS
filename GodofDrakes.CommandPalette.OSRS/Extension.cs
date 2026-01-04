@@ -12,9 +12,9 @@ namespace GodofDrakes.CommandPalette.OSRS;
 [Guid( "e2905630-80e8-4e23-a35b-ef3cfeb11a4b" )]
 internal sealed partial class Extension : HostedExtension
 {
-	private readonly ExtensionCommandProvider _provider;
+	private readonly Commands.ExtensionCommandProvider _provider;
 
-	public Extension( ExtensionCommandProvider provider )
+	public Extension( Commands.ExtensionCommandProvider provider )
 	{
 		ArgumentNullException.ThrowIfNull( provider );
 
